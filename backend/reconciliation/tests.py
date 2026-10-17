@@ -2,8 +2,10 @@ from datetime import date
 from decimal import Decimal
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.test import TestCase
+from rest_framework.test import APITestCase
 
 from .models import (
     Organization,
@@ -287,3 +289,268 @@ class ReconciliationModelTests(TestCase):
         self.assertEqual(CapitalCall.objects.filter(organization__slug__in=["northwind", "bluebird"]).count(), 3)
         self.assertEqual(InvestorEntity.objects.filter(organization__slug__in=["northwind", "bluebird"]).count(), 6)
         self.assertEqual(LineItem.objects.filter(organization__slug__in=["northwind", "bluebird"]).count(), 7)
+
+
+class BankStatementUploadTests(APITestCase):
+    def setUp(self):
+        self.org_northwind = Organization.objects.create(name="Northwind Ventures", slug="northwind")
+        self.org_bluebird = Organization.objects.create(name="Bluebird Capital", slug="bluebird")
+        self.upload_url = "/api/transactions/upload/"
+
+    def _make_csv_file(self, content: str, filename="statement.csv"):
+        return SimpleUploadedFile(filename, content.encode("utf-8"), content_type="text/csv")
+
+    def test_successful_csv_upload_and_debit_handling(self):
+        csv_content = (
+            "date,description,amount,type,reference\n"
+            "2026-04-03,WIRE INCOMING RAHUL SHAH TRUST,\"25,000.00\",credit,FT20260403A\n"
+            "2026-04-05,BANK FEE WIRE PROCESSING,-25.00,debit,FEE20260405\n"
+        )
+        csv_file = self._make_csv_file(csv_content)
+
+        response = self.client.post(
+            self.upload_url,
+            {"file": csv_file},
+            format="multipart",
+            HTTP_X_ORGANIZATION="northwind",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["imported_count"], 2)
+        self.assertEqual(response.data["ignored_count"], 1)
+        self.assertEqual(response.data["needs_review_count"], 1)
+
+        # Verify database records
+        credit_tx = BankTransaction.objects.get(bank_reference="FT20260403A", organization=self.org_northwind)
+        self.assertEqual(credit_tx.signed_amount, Decimal("25000.00"))
+        self.assertEqual(credit_tx.status, BankTransaction.Status.NEEDS_REVIEW)
+
+        debit_tx = BankTransaction.objects.get(bank_reference="FEE20260405", organization=self.org_northwind)
+        self.assertEqual(debit_tx.signed_amount, Decimal("-25.00"))
+        self.assertEqual(debit_tx.status, BankTransaction.Status.IGNORED)
+
+    def test_missing_required_headers(self):
+        # Missing 'reference' header
+        csv_content = "date,description,amount,type\n2026-04-03,WIRE INCOMING,25000.00,credit\n"
+        csv_file = self._make_csv_file(csv_content)
+
+        response = self.client.post(
+            self.upload_url,
+            {"file": csv_file},
+            format="multipart",
+            HTTP_X_ORGANIZATION="northwind",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["status"], "error")
+        self.assertTrue(any("reference" in err["message"] for err in response.data["errors"]))
+
+    def test_invalid_date(self):
+        # April 31 does not exist
+        csv_content = (
+            "date,description,amount,type,reference\n"
+            "2026-04-31,WIRE INCOMING,500.00,credit,REF-DATE-BAD\n"
+        )
+        csv_file = self._make_csv_file(csv_content)
+
+        response = self.client.post(
+            self.upload_url,
+            {"file": csv_file},
+            format="multipart",
+            HTTP_X_ORGANIZATION="northwind",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        error = response.data["errors"][0]
+        self.assertEqual(error["line"], 2)
+        self.assertEqual(error["column"], "date")
+        self.assertIn("Invalid date", error["message"])
+
+    def test_invalid_zero_and_negative_amounts(self):
+        # Non-numeric, zero, and negative credit
+        csv_content = (
+            "date,description,amount,type,reference\n"
+            "2026-04-01,TEST NON NUMERIC,abc,credit,REF-AMT-1\n"
+            "2026-04-02,TEST ZERO AMOUNT,0.00,credit,REF-AMT-2\n"
+            "2026-04-03,TEST NEGATIVE CREDIT,-500.00,credit,REF-AMT-3\n"
+        )
+        csv_file = self._make_csv_file(csv_content)
+
+        response = self.client.post(
+            self.upload_url,
+            {"file": csv_file},
+            format="multipart",
+            HTTP_X_ORGANIZATION="northwind",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        lines = [err["line"] for err in response.data["errors"]]
+        self.assertIn(2, lines)
+        self.assertIn(3, lines)
+        self.assertIn(4, lines)
+
+    def test_missing_required_values(self):
+        csv_content = (
+            "date,description,amount,type,reference\n"
+            ",WIRE INCOMING,25000.00,credit,REF-MISS-DATE\n"
+            "2026-04-03,,25000.00,credit,REF-MISS-DESC\n"
+            "2026-04-03,WIRE INCOMING,25000.00,credit,\n"
+        )
+        csv_file = self._make_csv_file(csv_content)
+
+        response = self.client.post(
+            self.upload_url,
+            {"file": csv_file},
+            format="multipart",
+            HTTP_X_ORGANIZATION="northwind",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertTrue(len(response.data["errors"]) >= 3)
+
+    def test_duplicate_transactions_within_file(self):
+        csv_content = (
+            "date,description,amount,type,reference\n"
+            "2026-04-03,WIRE 1,25000.00,credit,REF-FILE-DUP\n"
+            "2026-04-04,WIRE 2,10000.00,credit,REF-FILE-DUP\n"
+        )
+        csv_file = self._make_csv_file(csv_content)
+
+        response = self.client.post(
+            self.upload_url,
+            {"file": csv_file},
+            format="multipart",
+            HTTP_X_ORGANIZATION="northwind",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        error = response.data["errors"][0]
+        self.assertEqual(error["line"], 3)
+        self.assertEqual(error["column"], "reference")
+        self.assertIn("Duplicate transaction reference", error["message"])
+
+    def test_duplicate_transactions_already_in_database(self):
+        BankTransaction.objects.create(
+            organization=self.org_northwind,
+            transaction_date=date(2026, 4, 1),
+            description="EXISTING TX",
+            signed_amount=Decimal("5000.00"),
+            transaction_type="credit",
+            bank_reference="REF-ALREADY-IN-DB",
+        )
+
+        csv_content = (
+            "date,description,amount,type,reference\n"
+            "2026-04-02,NEW WIRE,5000.00,credit,REF-ALREADY-IN-DB\n"
+        )
+        csv_file = self._make_csv_file(csv_content)
+
+        response = self.client.post(
+            self.upload_url,
+            {"file": csv_file},
+            format="multipart",
+            HTTP_X_ORGANIZATION="northwind",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        error = response.data["errors"][0]
+        self.assertEqual(error["line"], 2)
+        self.assertIn("already exists", error["message"])
+
+    def test_organization_isolation_and_x_organization_header(self):
+        csv_content = (
+            "date,description,amount,type,reference\n"
+            "2026-04-02,WIRE,5000.00,credit,REF-CROSS-ORG\n"
+        )
+
+        # 1. Missing header
+        res_missing = self.client.post(self.upload_url, {"file": self._make_csv_file(csv_content)}, format="multipart")
+        self.assertEqual(res_missing.status_code, 400)
+        self.assertIn("X-Organization header is required", res_missing.data["error"])
+
+        # 2. Unknown organization
+        res_unknown = self.client.post(
+            self.upload_url,
+            {"file": self._make_csv_file(csv_content)},
+            format="multipart",
+            HTTP_X_ORGANIZATION="nonexistent-org",
+        )
+        self.assertEqual(res_unknown.status_code, 404)
+
+        # 3. Same reference in two different organizations is allowed
+        res_northwind = self.client.post(
+            self.upload_url,
+            {"file": self._make_csv_file(csv_content)},
+            format="multipart",
+            HTTP_X_ORGANIZATION="northwind",
+        )
+        self.assertEqual(res_northwind.status_code, 201)
+
+        res_bluebird = self.client.post(
+            self.upload_url,
+            {"file": self._make_csv_file(csv_content)},
+            format="multipart",
+            HTTP_X_ORGANIZATION="bluebird",
+        )
+        self.assertEqual(res_bluebird.status_code, 201)
+        self.assertEqual(BankTransaction.objects.filter(bank_reference="REF-CROSS-ORG").count(), 2)
+
+    def test_atomicity_rejects_all_when_one_row_fails(self):
+        # Row 1 valid, Row 2 invalid date, Row 3 valid
+        csv_content = (
+            "date,description,amount,type,reference\n"
+            "2026-04-01,VALID WIRE 1,1000.00,credit,REF-ATOMIC-1\n"
+            "2026-04-31,INVALID DATE,2000.00,credit,REF-ATOMIC-2\n"
+            "2026-04-03,VALID WIRE 3,3000.00,credit,REF-ATOMIC-3\n"
+        )
+        csv_file = self._make_csv_file(csv_content)
+
+        initial_count = BankTransaction.objects.filter(organization=self.org_northwind).count()
+        response = self.client.post(
+            self.upload_url,
+            {"file": csv_file},
+            format="multipart",
+            HTTP_X_ORGANIZATION="northwind",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        final_count = BankTransaction.objects.filter(organization=self.org_northwind).count()
+        # No records should be created
+        self.assertEqual(final_count, initial_count)
+
+    def test_file_size_and_type_validation(self):
+        # 1. Invalid file extension
+        txt_file = SimpleUploadedFile("statement.txt", b"some,content", content_type="text/plain")
+        res_type = self.client.post(
+            self.upload_url,
+            {"file": txt_file},
+            format="multipart",
+            HTTP_X_ORGANIZATION="northwind",
+        )
+        self.assertEqual(res_type.status_code, 400)
+        self.assertIn("Only CSV files", res_type.data["error"])
+
+        # 2. Empty file
+        empty_file = SimpleUploadedFile("empty.csv", b"", content_type="text/csv")
+        res_empty = self.client.post(
+            self.upload_url,
+            {"file": empty_file},
+            format="multipart",
+            HTTP_X_ORGANIZATION="northwind",
+        )
+        self.assertEqual(res_empty.status_code, 400)
+
+    def test_utf8_bom_handling(self):
+        # UTF-8 with BOM (\xef\xbb\xbf)
+        csv_content = "date,description,amount,type,reference\n2026-04-01,BOM WIRE,1000.00,credit,REF-BOM-1\n"
+        bom_bytes = b"\xef\xbb\xbf" + csv_content.encode("utf-8")
+        bom_file = SimpleUploadedFile("bom_statement.csv", bom_bytes, content_type="text/csv")
+
+        response = self.client.post(
+            self.upload_url,
+            {"file": bom_file},
+            format="multipart",
+            HTTP_X_ORGANIZATION="northwind",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(BankTransaction.objects.filter(bank_reference="REF-BOM-1").exists())
