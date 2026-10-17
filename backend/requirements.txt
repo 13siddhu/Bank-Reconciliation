@@ -1,0 +1,4 @@
+Django>=6.0,<6.2
+djangorestframework>=3.15,<3.19
+psycopg[binary]>=3.2.0
+python-dotenv>=1.0.0
