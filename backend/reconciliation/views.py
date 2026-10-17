@@ -616,3 +616,153 @@ class IgnoreTransactionView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+class OrganizationListView(APIView):
+    """
+    GET /api/organizations/
+    Returns list of available organizations for the organization switcher.
+    """
+    def get(self, request, *args, **kwargs):
+        orgs = Organization.objects.all().order_by('name')
+        data = [{"id": o.id, "slug": o.slug, "name": o.name} for o in orgs]
+        return Response(data, status=status.HTTP_200_OK)
+
+
+class DashboardSummaryView(APIView):
+    """
+    GET /api/dashboard/summary/
+    Returns summary statistics for the organization:
+    - Transaction counts by status
+    - Line item counts and financial totals
+    """
+    def get(self, request, *args, **kwargs):
+        organization, err = get_organization_from_request(request)
+        if err:
+            return err
+
+        txs = BankTransaction.objects.filter(organization=organization)
+        total_tx = txs.count()
+        suggested_count = txs.filter(status=BankTransaction.Status.SUGGESTED).count()
+        needs_review_count = txs.filter(status=BankTransaction.Status.NEEDS_REVIEW).count()
+        reconciled_count = txs.filter(status=BankTransaction.Status.RECONCILED).count()
+        ignored_count = txs.filter(status=BankTransaction.Status.IGNORED).count()
+
+        line_items = LineItem.objects.filter(organization=organization)
+        total_line_items = line_items.count()
+        total_called = sum((li.amount_called for li in line_items), Decimal('0.00'))
+        total_funded = sum((li.amount_funded for li in line_items), Decimal('0.00'))
+        total_remaining = sum((li.remaining_amount for li in line_items), Decimal('0.00'))
+
+        return Response({
+            "organization": {
+                "slug": organization.slug,
+                "name": organization.name,
+            },
+            "transactions": {
+                "total": total_tx,
+                "suggested": suggested_count,
+                "needs_review": needs_review_count,
+                "reconciled": reconciled_count,
+                "ignored": ignored_count,
+            },
+            "line_items": {
+                "total": total_line_items,
+                "total_called": str(total_called),
+                "total_funded": str(total_funded),
+                "total_remaining": str(total_remaining),
+            }
+        }, status=status.HTTP_200_OK)
+
+
+class TransactionListView(APIView):
+    """
+    GET /api/transactions/
+    Returns list of transactions for the organization, newest first.
+    Includes matches with details of associated line items.
+    """
+    def get(self, request, *args, **kwargs):
+        organization, err = get_organization_from_request(request)
+        if err:
+            return err
+
+        status_filter = request.query_params.get('status')
+        queryset = (
+            BankTransaction.objects.filter(organization=organization)
+            .prefetch_related('matches__line_item__investor_entity', 'matches__line_item__capital_call')
+            .order_by('-transaction_date', '-id')
+        )
+        if status_filter:
+            queryset = queryset.filter(status=status_filter)
+
+        results = []
+        for tx in queryset:
+            matches_data = []
+            for m in tx.matches.all():
+                li = m.line_item
+                matches_data.append({
+                    "id": m.id,
+                    "status": m.status,
+                    "match_reason": m.match_reason,
+                    "line_item": {
+                        "id": li.id,
+                        "capital_call": li.capital_call.call_number,
+                        "investor_name": li.investor_entity.name,
+                        "expected_wire_reference": li.expected_wire_reference,
+                        "amount_called": str(li.amount_called),
+                        "amount_funded": str(li.amount_funded),
+                        "remaining_amount": str(li.remaining_amount),
+                        "status": li.status,
+                    }
+                })
+
+            results.append({
+                "id": tx.id,
+                "transaction_date": tx.transaction_date.isoformat(),
+                "description": tx.description,
+                "signed_amount": str(tx.signed_amount),
+                "transaction_type": tx.transaction_type,
+                "bank_reference": tx.bank_reference,
+                "status": tx.status,
+                "review_reason": tx.import_metadata.get("review_reason", ""),
+                "matches": matches_data,
+            })
+
+        return Response(results, status=status.HTTP_200_OK)
+
+
+class LineItemListView(APIView):
+    """
+    GET /api/line-items/
+    Returns list of capital call line items for the organization.
+    """
+    def get(self, request, *args, **kwargs):
+        organization, err = get_organization_from_request(request)
+        if err:
+            return err
+
+        line_items = (
+            LineItem.objects.filter(organization=organization)
+            .select_related('investor_entity', 'capital_call')
+            .order_by('capital_call__call_number', 'id')
+        )
+
+        results = [
+            {
+                "id": li.id,
+                "capital_call": {
+                    "call_number": li.capital_call.call_number,
+                    "call_date": li.capital_call.call_date.isoformat(),
+                    "due_date": li.capital_call.due_date.isoformat(),
+                },
+                "investor_name": li.investor_entity.name,
+                "expected_wire_reference": li.expected_wire_reference,
+                "amount_called": str(li.amount_called),
+                "amount_funded": str(li.amount_funded),
+                "remaining_amount": str(li.remaining_amount),
+                "status": li.status,
+            }
+            for li in line_items
+        ]
+
+        return Response(results, status=status.HTTP_200_OK)

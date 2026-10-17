@@ -1086,3 +1086,132 @@ class ReconciliationActionsAPITests(APITestCase):
         self.assertIn("Debit transactions cannot be approved", res.data["error"])
         self.line_item.refresh_from_db()
         self.assertEqual(self.line_item.amount_funded, Decimal("0.00"))
+
+
+class ReadOnlyEndpointsTests(APITestCase):
+    def setUp(self):
+        self.org_northwind = Organization.objects.create(name="Northwind Ventures", slug="northwind")
+        self.org_bluebird = Organization.objects.create(name="Bluebird Capital", slug="bluebird")
+
+        self.call_north = CapitalCall.objects.create(
+            organization=self.org_northwind,
+            call_number="#1",
+            call_date=date(2026, 3, 25),
+            due_date=date(2026, 4, 10),
+        )
+        self.inv_north = InvestorEntity.objects.create(
+            organization=self.org_northwind,
+            name="Rahul Shah Trust",
+        )
+        self.li_north = LineItem.objects.create(
+            organization=self.org_northwind,
+            capital_call=self.call_north,
+            investor_entity=self.inv_north,
+            expected_wire_reference="CC-1002",
+            amount_called=Decimal("25000.00"),
+            amount_funded=Decimal("5000.00"),
+            status=LineItem.Status.PARTIALLY_FUNDED,
+        )
+
+        self.tx_north = BankTransaction.objects.create(
+            organization=self.org_northwind,
+            transaction_date=date(2026, 4, 3),
+            description="WIRE INCOMING RAHUL SHAH TRUST REF CC-1002",
+            signed_amount=Decimal("20000.00"),
+            transaction_type="credit",
+            bank_reference="FT-LIST-1",
+            status=BankTransaction.Status.SUGGESTED,
+        )
+        self.match_north = Match.objects.create(
+            organization=self.org_northwind,
+            bank_transaction=self.tx_north,
+            line_item=self.li_north,
+            status=Match.Status.PROPOSED,
+            match_reason="Reference found",
+        )
+
+        # Bluebird data for isolation testing
+        self.call_blue = CapitalCall.objects.create(
+            organization=self.org_bluebird,
+            call_number="#1",
+            call_date=date(2026, 4, 1),
+            due_date=date(2026, 4, 15),
+        )
+        self.inv_blue = InvestorEntity.objects.create(
+            organization=self.org_bluebird,
+            name="Cedar Grove Fund LP",
+        )
+        self.li_blue = LineItem.objects.create(
+            organization=self.org_bluebird,
+            capital_call=self.call_blue,
+            investor_entity=self.inv_blue,
+            expected_wire_reference="CC-2001",
+            amount_called=Decimal("40000.00"),
+            amount_funded=Decimal("0.00"),
+            status=LineItem.Status.OPEN,
+        )
+
+    def test_organization_list_endpoint(self):
+        res = self.client.get("/api/organizations/")
+        self.assertEqual(res.status_code, 200)
+        slugs = [o["slug"] for o in res.data]
+        self.assertIn("northwind", slugs)
+        self.assertIn("bluebird", slugs)
+
+    def test_dashboard_summary_endpoint_and_isolation(self):
+        # 1. Northwind summary
+        res_north = self.client.get("/api/dashboard/summary/", HTTP_X_ORGANIZATION="northwind")
+        self.assertEqual(res_north.status_code, 200)
+        self.assertEqual(res_north.data["organization"]["slug"], "northwind")
+        self.assertEqual(res_north.data["transactions"]["total"], 1)
+        self.assertEqual(res_north.data["transactions"]["suggested"], 1)
+        self.assertEqual(res_north.data["line_items"]["total"], 1)
+        self.assertEqual(res_north.data["line_items"]["total_called"], "25000.00")
+        self.assertEqual(res_north.data["line_items"]["total_funded"], "5000.00")
+        self.assertEqual(res_north.data["line_items"]["total_remaining"], "20000.00")
+
+        # 2. Bluebird summary (has 0 transactions, 1 line item)
+        res_blue = self.client.get("/api/dashboard/summary/", HTTP_X_ORGANIZATION="bluebird")
+        self.assertEqual(res_blue.status_code, 200)
+        self.assertEqual(res_blue.data["transactions"]["total"], 0)
+        self.assertEqual(res_blue.data["line_items"]["total_called"], "40000.00")
+
+        # 3. Missing header returns 400
+        res_no_hdr = self.client.get("/api/dashboard/summary/")
+        self.assertEqual(res_no_hdr.status_code, 400)
+
+        # 4. Unknown org returns 404
+        res_unknown = self.client.get("/api/dashboard/summary/", HTTP_X_ORGANIZATION="unknown-org")
+        self.assertEqual(res_unknown.status_code, 404)
+
+    def test_transaction_list_endpoint_and_matches_formatting(self):
+        res = self.client.get("/api/transactions/", HTTP_X_ORGANIZATION="northwind")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(len(res.data), 1)
+
+        tx_item = res.data[0]
+        self.assertEqual(tx_item["bank_reference"], "FT-LIST-1")
+        self.assertEqual(tx_item["status"], "suggested")
+        self.assertEqual(len(tx_item["matches"]), 1)
+
+        match_info = tx_item["matches"][0]
+        self.assertEqual(match_info["status"], "proposed")
+        self.assertEqual(match_info["line_item"]["investor_name"], "Rahul Shah Trust")
+
+        # Bluebird transaction list returns 0 items
+        res_blue = self.client.get("/api/transactions/", HTTP_X_ORGANIZATION="bluebird")
+        self.assertEqual(res_blue.status_code, 200)
+        self.assertEqual(len(res_blue.data), 0)
+
+    def test_line_item_list_endpoint_and_isolation(self):
+        res = self.client.get("/api/line-items/", HTTP_X_ORGANIZATION="northwind")
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(len(res.data), 1)
+        self.assertEqual(res.data[0]["expected_wire_reference"], "CC-1002")
+        self.assertEqual(res.data[0]["remaining_amount"], "20000.00")
+
+        # Bluebird returns only Bluebird's line item
+        res_blue = self.client.get("/api/line-items/", HTTP_X_ORGANIZATION="bluebird")
+        self.assertEqual(res_blue.status_code, 200)
+        self.assertEqual(len(res_blue.data), 1)
+        self.assertEqual(res_blue.data[0]["expected_wire_reference"], "CC-2001")
