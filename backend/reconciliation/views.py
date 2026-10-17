@@ -9,39 +9,55 @@ from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .models import BankTransaction, Organization
+from .models import BankTransaction, LineItem, Match, Organization
+from .services import run_matching_for_transactions
 
 
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
 REQUIRED_HEADERS = ['date', 'description', 'amount', 'type', 'reference']
 
 
+def get_organization_from_request(request):
+    """
+    Resolves organization from the X-Organization header.
+    Returns (organization, None) if successful.
+    Returns (None, error_response) if missing (400) or unknown (404).
+    """
+    org_slug = request.headers.get('X-Organization') or request.META.get('HTTP_X_ORGANIZATION')
+    if not org_slug:
+        return None, Response(
+            {"error": "X-Organization header is required."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        organization = Organization.objects.get(slug=org_slug.strip())
+        return organization, None
+    except Organization.DoesNotExist:
+        return None, Response(
+            {"error": f"Organization '{org_slug}' not found."},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+
 class TransactionCSVUploadView(APIView):
     """
     POST /api/transactions/upload/
-    Uploads a bank statement CSV and validates all rows atomically.
-    Requires 'X-Organization' header with organization slug.
+    Uploads a bank statement CSV and processes rows.
+    - Missing required headers reject the entire file (HTTP 400).
+    - Invalid data rows are skipped and reported with their CSV line number.
+    - Duplicate rows within file and against database are skipped and reported.
+    - Valid rows are imported.
+    - Debits are marked ignored; credits immediately run through matching suggestions.
     """
     parser_classes = [MultiPartParser, FormParser]
 
     def post(self, request, *args, **kwargs):
-        # 1. Resolve organization from X-Organization header
-        org_slug = request.headers.get('X-Organization') or request.META.get('HTTP_X_ORGANIZATION')
-        if not org_slug:
-            return Response(
-                {"error": "X-Organization header is required."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        organization, err_response = get_organization_from_request(request)
+        if err_response:
+            return err_response
 
-        try:
-            organization = Organization.objects.get(slug=org_slug.strip())
-        except Organization.DoesNotExist:
-            return Response(
-                {"error": f"Organization '{org_slug}' not found."},
-                status=status.HTTP_404_NOT_FOUND,
-            )
-
-        # 2. File validation
+        # File validation
         uploaded_file = request.FILES.get('file')
         if not uploaded_file:
             return Response(
@@ -67,7 +83,7 @@ class TransactionCSVUploadView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # 3. Safe decoding (utf-8-sig handles UTF-8 BOM transparently)
+        # Safe decoding (utf-8-sig handles UTF-8 BOM transparently)
         try:
             content_bytes = uploaded_file.read()
             decoded_content = content_bytes.decode('utf-8-sig')
@@ -83,7 +99,7 @@ class TransactionCSVUploadView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # 4. Header validation
+        # Header validation
         stream = io.StringIO(decoded_content)
         reader = csv.reader(stream)
 
@@ -121,15 +137,22 @@ class TransactionCSVUploadView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # 5. Row-level validation
+        # Row-level validation and duplicate checking
         errors = []
         records_to_create = []
-        seen_references = {}  # reference -> first physical CSV line number
+        seen_references_in_file = set()
+        duplicates_count = 0
+
+        existing_db_refs = set(
+            BankTransaction.objects.filter(
+                organization=organization
+            ).values_list('bank_reference', flat=True)
+        )
 
         for row in reader:
             line_no = reader.line_num
 
-            # Skip blank lines
+            # Skip blank lines silently
             if not row or not any(cell.strip() for cell in row):
                 continue
 
@@ -149,7 +172,7 @@ class TransactionCSVUploadView(APIView):
 
             row_has_error = False
 
-            # Reference
+            # Reference validation & duplicate detection
             if not raw_reference:
                 errors.append({
                     "line": line_no,
@@ -157,17 +180,26 @@ class TransactionCSVUploadView(APIView):
                     "message": "Transaction reference is required.",
                 })
                 row_has_error = True
-            elif raw_reference in seen_references:
+            elif raw_reference in seen_references_in_file:
+                duplicates_count += 1
                 errors.append({
                     "line": line_no,
                     "column": "reference",
-                    "message": f"Duplicate transaction reference '{raw_reference}' within uploaded file (first seen on line {seen_references[raw_reference]}).",
+                    "message": f"Duplicate transaction reference '{raw_reference}' within uploaded file.",
+                })
+                row_has_error = True
+            elif raw_reference in existing_db_refs:
+                duplicates_count += 1
+                errors.append({
+                    "line": line_no,
+                    "column": "reference",
+                    "message": f"Transaction reference '{raw_reference}' already exists for organization '{organization.slug}'.",
                 })
                 row_has_error = True
             else:
-                seen_references[raw_reference] = line_no
+                seen_references_in_file.add(raw_reference)
 
-            # Date
+            # Date validation
             parsed_date = None
             if not raw_date:
                 errors.append({
@@ -187,7 +219,7 @@ class TransactionCSVUploadView(APIView):
                     })
                     row_has_error = True
 
-            # Transaction type
+            # Transaction type validation
             tx_type = raw_type.lower()
             if not tx_type:
                 errors.append({
@@ -204,7 +236,7 @@ class TransactionCSVUploadView(APIView):
                 })
                 row_has_error = True
 
-            # Monetary amount
+            # Monetary amount validation
             parsed_amount = None
             signed_amount = None
             if not raw_amount:
@@ -236,7 +268,7 @@ class TransactionCSVUploadView(APIView):
                         })
                         row_has_error = True
                     elif tx_type == 'credit':
-                        if parsed_amount < 0:
+                        if parsed_amount <= 0:
                             errors.append({
                                 "line": line_no,
                                 "column": "amount",
@@ -246,9 +278,17 @@ class TransactionCSVUploadView(APIView):
                         else:
                             signed_amount = parsed_amount
                     elif tx_type == 'debit':
-                        signed_amount = -abs(parsed_amount)
+                        if parsed_amount >= 0:
+                            errors.append({
+                                "line": line_no,
+                                "column": "amount",
+                                "message": f"Debit transaction amount must be negative, got '{raw_amount}'.",
+                            })
+                            row_has_error = True
+                        else:
+                            signed_amount = parsed_amount
 
-            # Description
+            # Description validation
             if not raw_description:
                 errors.append({
                     "line": line_no,
@@ -280,78 +320,299 @@ class TransactionCSVUploadView(APIView):
                     },
                 })
 
-        # 6. Check duplicates already existing in database for this organization
-        if seen_references:
-            existing_db_refs = set(
-                BankTransaction.objects.filter(
-                    organization=organization,
-                    bank_reference__in=seen_references.keys(),
-                ).values_list('bank_reference', flat=True)
-            )
-            for ref in existing_db_refs:
-                errors.append({
-                    "line": seen_references[ref],
-                    "column": "reference",
-                    "message": f"Transaction reference '{ref}' already exists for organization '{organization.slug}'.",
-                })
+        # Database transaction: persist valid rows and run matching suggestions on credits
+        created_transactions = []
+        if records_to_create:
+            try:
+                with transaction.atomic():
+                    created_transactions = BankTransaction.objects.bulk_create([
+                        BankTransaction(
+                            organization=rec["organization"],
+                            transaction_date=rec["transaction_date"],
+                            description=rec["description"],
+                            signed_amount=rec["signed_amount"],
+                            transaction_type=rec["transaction_type"],
+                            bank_reference=rec["bank_reference"],
+                            status=rec["status"],
+                            import_metadata=rec["import_metadata"],
+                        )
+                        for rec in records_to_create
+                    ])
+                    credit_transactions = [
+                        tx for tx in created_transactions
+                        if tx.transaction_type == 'credit' and tx.status != BankTransaction.Status.IGNORED
+                    ]
+                    if credit_transactions:
+                        run_matching_for_transactions(credit_transactions, organization)
+            except IntegrityError as exc:
+                return Response(
+                    {
+                        "status": "error",
+                        "message": f"Database integrity error during transaction save: {exc}",
+                        "errors": [
+                            {
+                                "line": 0,
+                                "column": "database",
+                                "message": "Concurrent duplicate or integrity error.",
+                            }
+                        ],
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
-        if not records_to_create and not errors:
-            return Response(
-                {"error": "CSV file contains no valid data rows to import."},
-                status=status.HTTP_400_BAD_REQUEST,
+        errors.sort(key=lambda x: (x.get("line", 0), x.get("column", "")))
+        imported_count = len(created_transactions)
+
+        return Response(
+            {
+                "status": "success" if imported_count > 0 else ("empty" if not errors else "partial"),
+                "message": (
+                    f"Successfully processed CSV: {imported_count} imported, "
+                    f"{duplicates_count} duplicate(s) skipped, {len(errors)} error(s)."
+                ),
+                "imported_count": imported_count,
+                "duplicates_count": duplicates_count,
+                "errors": errors,
+            },
+            status=status.HTTP_201_CREATED if imported_count > 0 else status.HTTP_200_OK,
+        )
+
+
+class ApproveMatchView(APIView):
+    """
+    POST /api/matches/<int:match_id>/approve/
+    Approves a proposed match in an atomic transaction:
+    - Verifies match belongs to organization and is still 'proposed'
+    - Locks Match, BankTransaction, and LineItem using select_for_update()
+    - Re-checks transaction amount against line item remaining amount (returns 409 if exceeds)
+    - Prevents double-funding (returns 409 if already reconciled or match already processed)
+    - Adds amount to line item funded amount, updates status ('funded' or 'partially_funded')
+    - Marks chosen match 'approved'
+    - Rejects other proposed matches for the same transaction
+    - Marks transaction 'reconciled'
+    """
+    def post(self, request, match_id, *args, **kwargs):
+        organization, err_response = get_organization_from_request(request)
+        if err_response:
+            return err_response
+
+        with transaction.atomic():
+            try:
+                match = (
+                    Match.objects.select_for_update()
+                    .get(id=match_id, organization=organization)
+                )
+            except Match.DoesNotExist:
+                return Response(
+                    {"error": f"Match with id {match_id} not found."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            bank_tx = (
+                BankTransaction.objects.select_for_update()
+                .get(id=match.bank_transaction_id, organization=organization)
+            )
+            line_item = (
+                LineItem.objects.select_for_update()
+                .get(id=match.line_item_id, organization=organization)
             )
 
-        # 7. All-or-nothing: if any errors occurred, reject entire upload
-        if errors:
-            errors.sort(key=lambda x: (x.get("line", 0), x.get("column", "")))
-            return Response(
-                {
-                    "status": "error",
-                    "message": "Validation failed for uploaded CSV.",
-                    "errors": errors,
-                },
-                status=status.HTTP_400_BAD_REQUEST,
+            # State validations
+            if match.status != Match.Status.PROPOSED:
+                return Response(
+                    {"error": f"Match #{match_id} is already '{match.status}'. Only proposed matches can be approved."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            if bank_tx.status == BankTransaction.Status.RECONCILED:
+                return Response(
+                    {"error": f"Transaction #{bank_tx.id} is already reconciled."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            if bank_tx.transaction_type == 'debit' or bank_tx.signed_amount <= 0:
+                return Response(
+                    {"error": "Debit transactions cannot be approved."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            if bank_tx.status == BankTransaction.Status.IGNORED:
+                return Response(
+                    {"error": "Ignored transactions cannot be approved."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            # Re-check remaining amount against transaction amount
+            remaining = line_item.remaining_amount
+            amount_to_fund = bank_tx.signed_amount
+
+            if amount_to_fund > remaining:
+                return Response(
+                    {
+                        "error": (
+                            f"Transaction amount ({amount_to_fund}) exceeds remaining "
+                            f"line item amount ({remaining})."
+                        )
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            # Add transaction's credit amount to amount_funded exactly once
+            new_amount_funded = line_item.amount_funded + amount_to_fund
+            line_item.amount_funded = new_amount_funded
+            if new_amount_funded >= line_item.amount_called:
+                line_item.status = LineItem.Status.FUNDED
+            else:
+                line_item.status = LineItem.Status.PARTIALLY_FUNDED
+            line_item.save(update_fields=['amount_funded', 'status'])
+
+            # Mark chosen match approved
+            match.status = Match.Status.APPROVED
+            match.save(update_fields=['status'])
+
+            # Mark competing proposed matches for this transaction rejected
+            bank_tx.matches.filter(status=Match.Status.PROPOSED).exclude(id=match.id).update(
+                status=Match.Status.REJECTED
             )
 
-        # 8. All-or-nothing atomic write
-        try:
-            with transaction.atomic():
-                created_transactions = BankTransaction.objects.bulk_create([
-                    BankTransaction(
-                        organization=rec["organization"],
-                        transaction_date=rec["transaction_date"],
-                        description=rec["description"],
-                        signed_amount=rec["signed_amount"],
-                        transaction_type=rec["transaction_type"],
-                        bank_reference=rec["bank_reference"],
-                        status=rec["status"],
-                        import_metadata=rec["import_metadata"],
-                    )
-                    for rec in records_to_create
-                ])
-        except IntegrityError:
-            return Response(
-                {
-                    "status": "error",
-                    "message": "Database constraint violation occurred during import. A transaction with this reference may have been concurrently imported.",
-                    "errors": [
-                        {
-                            "line": 0,
-                            "column": "reference",
-                            "message": "Duplicate transaction reference detected by database constraint.",
-                        }
-                    ],
-                },
-                status=status.HTTP_400_BAD_REQUEST,
+            # Mark transaction reconciled
+            bank_tx.status = BankTransaction.Status.RECONCILED
+            bank_tx.save(update_fields=['status'])
+
+        return Response(
+            {
+                "status": "success",
+                "message": f"Match #{match_id} approved successfully.",
+                "match_id": match.id,
+                "match_status": match.status,
+                "transaction_id": bank_tx.id,
+                "transaction_status": bank_tx.status,
+                "line_item_id": line_item.id,
+                "line_item_status": line_item.status,
+                "amount_funded": str(line_item.amount_funded),
+                "remaining_amount": str(line_item.remaining_amount),
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class RejectMatchView(APIView):
+    """
+    POST /api/matches/<int:match_id>/reject/
+    Rejects a proposed match:
+    - Only allows rejection of a match that is currently 'proposed' (returns 409 otherwise)
+    - Marks match 'rejected'
+    - If no other proposed matches remain for that transaction, updates transaction to 'needs_review'
+    - If other proposed matches remain, preserves current transaction status
+    - Never modifies amount_funded
+    """
+    def post(self, request, match_id, *args, **kwargs):
+        organization, err_response = get_organization_from_request(request)
+        if err_response:
+            return err_response
+
+        with transaction.atomic():
+            try:
+                match = (
+                    Match.objects.select_for_update()
+                    .get(id=match_id, organization=organization)
+                )
+            except Match.DoesNotExist:
+                return Response(
+                    {"error": f"Match with id {match_id} not found."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            bank_tx = (
+                BankTransaction.objects.select_for_update()
+                .get(id=match.bank_transaction_id, organization=organization)
+            )
+
+            if match.status != Match.Status.PROPOSED:
+                return Response(
+                    {"error": f"Match #{match_id} is already '{match.status}'. Only proposed matches can be rejected."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            # Mark match rejected
+            match.status = Match.Status.REJECTED
+            match.save(update_fields=['status'])
+
+            # Check if any proposed matches remain for this transaction
+            remaining_proposed = bank_tx.matches.filter(status=Match.Status.PROPOSED).exists()
+            if not remaining_proposed:
+                if bank_tx.status != BankTransaction.Status.RECONCILED:
+                    bank_tx.status = BankTransaction.Status.NEEDS_REVIEW
+                    bank_tx.save(update_fields=['status'])
+
+        return Response(
+            {
+                "status": "success",
+                "message": f"Match #{match_id} rejected successfully.",
+                "match_id": match.id,
+                "match_status": match.status,
+                "transaction_id": bank_tx.id,
+                "transaction_status": bank_tx.status,
+                "remaining_proposed_matches": remaining_proposed,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class IgnoreTransactionView(APIView):
+    """
+    POST /api/transactions/<int:transaction_id>/ignore/
+    Marks a transaction ignored:
+    - Allows ignoring credit transactions in 'suggested' or 'needs_review' status
+    - On a reconciled transaction, returns HTTP 409
+    - Marks transaction 'ignored'
+    - Marks all outstanding proposed matches 'rejected'
+    - Does not modify line item funding totals
+    """
+    def post(self, request, transaction_id, *args, **kwargs):
+        organization, err_response = get_organization_from_request(request)
+        if err_response:
+            return err_response
+
+        with transaction.atomic():
+            try:
+                bank_tx = (
+                    BankTransaction.objects.select_for_update()
+                    .get(id=transaction_id, organization=organization)
+                )
+            except BankTransaction.DoesNotExist:
+                return Response(
+                    {"error": f"Transaction with id {transaction_id} not found."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            if bank_tx.status == BankTransaction.Status.RECONCILED:
+                return Response(
+                    {"error": "Cannot ignore a reconciled transaction."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            if bank_tx.status == BankTransaction.Status.IGNORED:
+                return Response(
+                    {"error": f"Transaction #{transaction_id} is already ignored."},
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            # Mark transaction ignored
+            bank_tx.status = BankTransaction.Status.IGNORED
+            bank_tx.save(update_fields=['status'])
+
+            # Mark outstanding proposed matches rejected
+            bank_tx.matches.filter(status=Match.Status.PROPOSED).update(
+                status=Match.Status.REJECTED
             )
 
         return Response(
             {
                 "status": "success",
-                "message": f"Successfully imported {len(created_transactions)} bank transactions.",
-                "imported_count": len(created_transactions),
-                "ignored_count": sum(1 for r in records_to_create if r["status"] == BankTransaction.Status.IGNORED),
-                "needs_review_count": sum(1 for r in records_to_create if r["status"] == BankTransaction.Status.NEEDS_REVIEW),
+                "message": f"Transaction #{transaction_id} marked as ignored.",
+                "transaction_id": bank_tx.id,
+                "transaction_status": bank_tx.status,
             },
-            status=status.HTTP_201_CREATED,
+            status=status.HTTP_200_OK,
         )
